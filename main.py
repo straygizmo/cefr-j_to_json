@@ -685,10 +685,15 @@ def process_slash_variants(headword: str) -> List[str]:
     """Process headwords with slashes to extract all variants."""
     return [v.strip() for v in headword.split('/')]
 
-def read_csv_with_bom(filepath: Path) -> List[Dict[str, str]]:
-    """Read CSV file handling UTF-8 BOM if present."""
-    with open(filepath, 'r', encoding='utf-8-sig') as f:
-        return list(csv.DictReader(f))
+def read_csv_with_bom(filepath: Path, encoding: str = 'utf-8-sig') -> List[Dict[str, str]]:
+    """Read CSV file handling different encodings."""
+    try:
+        with open(filepath, 'r', encoding=encoding) as f:
+            return list(csv.DictReader(f))
+    except UnicodeDecodeError:
+        # Try with ISO-8859-1 encoding
+        with open(filepath, 'r', encoding='iso-8859-1') as f:
+            return list(csv.DictReader(f))
 
 def get_word_family(word: str, pos: str) -> Set[str]:
     """Generate word family based on word and part of speech."""
@@ -748,9 +753,79 @@ def compare_cefr_levels(level1: str, level2: str) -> int:
     order = {'A1': 0, 'A2': 1, 'B1': 2, 'B2': 3, 'C1': 4, 'C2': 5}
     return order.get(level1, 6) - order.get(level2, 6)
 
+def load_ngsl_data() -> Tuple[Set[str], Set[str], Set[str], Set[str]]:
+    """Load words from NGSL CSV files."""
+    ngsl_words = set()
+    nawl_words = set()
+    tsl_words = set()
+    bsl_words = set()
+    
+    ngsl_dir = Path('assets/ngsl')
+    
+    # Load NGSL words
+    ngsl_file = ngsl_dir / 'NGSL_1.2_stats.csv'
+    if ngsl_file.exists():
+        rows = read_csv_with_bom(ngsl_file)
+        for row in rows:
+            word = row.get('Lemma', '').strip().lower()
+            if word:
+                ngsl_words.add(word)
+    
+    # Load NAWL words
+    nawl_file = ngsl_dir / 'NAWL_1.2_with_en_definitions.csv'
+    if nawl_file.exists():
+        rows = read_csv_with_bom(nawl_file)
+        for row in rows:
+            word = row.get('Meanings', '').strip().lower()
+            if word:
+                nawl_words.add(word)
+    
+    # Load TSL words
+    tsl_file = ngsl_dir / 'TSL_1.2_stats.csv'
+    if tsl_file.exists():
+        rows = read_csv_with_bom(tsl_file)
+        for row in rows:
+            word = row.get('Word', '').strip().lower()
+            if word:
+                tsl_words.add(word)
+    
+    # Load BSL words
+    bsl_file = ngsl_dir / 'BSL_1.20_stats.csv'
+    if bsl_file.exists():
+        rows = read_csv_with_bom(bsl_file)
+        for row in rows:
+            word = row.get('Word', '').strip().lower()
+            if word:
+                bsl_words.add(word)
+    
+    return ngsl_words, nawl_words, tsl_words, bsl_words
+
+def get_ngsl_list_name(word: str, ngsl_words: Set[str], nawl_words: Set[str], 
+                       tsl_words: Set[str], bsl_words: Set[str]) -> str:
+    """Get the name of the NGSL list that contains the word (priority: NGSL > NAWL > TSL > BSL)."""
+    word_lower = word.lower()
+    if word_lower in ngsl_words:
+        return "NGSL"
+    elif word_lower in nawl_words:
+        return "NAWL"
+    elif word_lower in tsl_words:
+        return "TSL"
+    elif word_lower in bsl_words:
+        return "BSL"
+    return ""
+
 def main():
     vocabulary_data = []
     word_entries = defaultdict(list)
+    
+    # Load NGSL data if ngsl directory exists
+    ngsl_dir = Path('assets/ngsl')
+    if ngsl_dir.exists():
+        ngsl_words, nawl_words, tsl_words, bsl_words = load_ngsl_data()
+        print(f"Loaded NGSL data: {len(ngsl_words)} NGSL, {len(nawl_words)} NAWL, {len(tsl_words)} TSL, {len(bsl_words)} BSL words")
+    else:
+        ngsl_words, nawl_words, tsl_words, bsl_words = set(), set(), set(), set()
+        print("NGSL directory not found, skipping NGSL data loading")
     
     # Process all CSV files in the assets folder
     assets_dir = Path('assets')
@@ -837,6 +912,12 @@ def main():
         main_entry['base_form'] = base_word
         main_entry['word_family'] = sorted(list(all_word_forms))
         
+        # Add NGSL boolean fields
+        main_entry['NGSL'] = base_word in ngsl_words
+        main_entry['NAWL'] = base_word in nawl_words
+        main_entry['TSL'] = base_word in tsl_words
+        main_entry['BSL'] = base_word in bsl_words
+        
         if american_forms or british_forms:
             main_entry['variants'] = {}
             if american_forms:
@@ -850,16 +931,44 @@ def main():
         
         vocabulary_data.append(main_entry)
     
+    # Add words that only exist in NGSL files
+    existing_base_forms = {entry['base_form'] for entry in vocabulary_data}
+    all_ngsl_words = ngsl_words | nawl_words | tsl_words | bsl_words
+    
+    for word in all_ngsl_words:
+        if word not in existing_base_forms:
+            # Create entry for NGSL-only word
+            entry = {
+                'word': word,
+                'pos': '',
+                'CEFR': '',
+                'NGSL': word in ngsl_words,
+                'NAWL': word in nawl_words,
+                'TSL': word in tsl_words,
+                'BSL': word in bsl_words,
+                'CoreInventory 1': '',
+                'CoreInventory 2': '',
+                'Threshold': '',
+                'notes': '',
+                'base_form': word,
+                'word_family': sorted(list(get_word_family(word, 'noun')))  # Default to noun for word family generation
+            }
+            vocabulary_data.append(entry)
+    
     vocabulary_json = {'vocabulary': vocabulary_data}
     with open('vocabulary.json', 'w', encoding='utf-8') as f:
         json.dump(vocabulary_json, f, ensure_ascii=False, indent=2)
     
     word_lookup = {}
     for entry in vocabulary_data:
+        # Determine NGSL list name for lookup
+        ngsl_list_name = get_ngsl_list_name(entry['base_form'], ngsl_words, nawl_words, tsl_words, bsl_words)
+        
         lookup_info = {
             'base_form': entry['base_form'],
             'pos': entry['pos'],
-            'CEFR': entry['CEFR']
+            'CEFR': entry['CEFR'],
+            'NGSL': ngsl_list_name
         }
         
         for word in entry['word_family']:
